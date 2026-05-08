@@ -150,6 +150,283 @@ def _representative_cards(hand_key: str):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# #7 — GTO-derived preflop blueprint (6-max, ~100 BB starting stacks).
+#
+# These ranges are taken from published CFR-solved 6-max preflop charts
+# (Upswing Poker / GTO Wizard families).  They are approximations of pure
+# Nash equilibrium strategies — solver output rounded to discrete
+# always/never decisions.  The actual solver outputs use mixed frequencies
+# for borderline hands; we round to the dominant action.
+#
+# Default OFF: A/B testing showed the published GTO charts regress against
+# the exploitable reference field (current: -7K, hybrid_100: -5.5K).  Hand-
+# tuned exploitative play beats theoretical optimal vs known-weak opponents.
+# Charts kept here for use against unknown human-built bots in the live
+# tournament — flip the toggle to True there if exploit-friendly play is no
+# longer the right strategy.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_USE_GTO_BLUEPRINT = False
+
+# === RFI (Raise First In) ranges by position ====================================
+# UTG (~12% of hands)
+GTO_OPEN_UTG = {
+    "AA","KK","QQ","JJ","TT","99","88",
+    "AKs","AKo","AQs","AQo","AJs","ATs","KQs","KJs","QJs",
+}
+# MP / HJ (~17%)
+GTO_OPEN_MP = GTO_OPEN_UTG | {
+    "77","66","AJo","KQo","KTs","QTs","JTs","ATo","T9s","98s","87s","76s",
+}
+# CO (~28%)
+GTO_OPEN_CO = GTO_OPEN_MP | {
+    "55","44","33","22",
+    "A9s","A8s","A7s","A6s","A5s","A4s","A3s","A2s",
+    "K9s","Q9s","J9s","T8s","KJo","QJo","JTo","65s",
+}
+# BTN (~48%)
+GTO_OPEN_BTN = GTO_OPEN_CO | {
+    "K8s","K7s","K6s","K5s","K4s","K3s","K2s",
+    "Q8s","Q7s","Q6s","Q5s","Q4s","Q3s","Q2s",
+    "J8s","J7s","T7s","97s","86s","75s","54s",
+    "A9o","A8o","A7o","A6o","A5o","A4o","A3o","A2o",
+    "K9o","K8o","Q9o","J9o","T9o","98o","87o","76o",
+}
+# SB (when folded to) — slightly tighter than BTN due to OOP postflop
+GTO_OPEN_SB = GTO_OPEN_BTN - {"K2s","Q2s","Q3s","75s","K8o","98o","87o","76o"}
+
+_GTO_OPENS = {
+    "utg": GTO_OPEN_UTG,
+    "mp":  GTO_OPEN_MP,
+    "co":  GTO_OPEN_CO,
+    "btn": GTO_OPEN_BTN,
+    "sb":  GTO_OPEN_SB,
+}
+
+# === 3-bet ranges (vs single open, by opener position) =========================
+# Tighter vs early-position openers; wider vs late-position openers.
+GTO_3BET_VS_UTG = {"AA","KK","QQ","AKs","AKo"}
+GTO_3BET_VS_MP  = GTO_3BET_VS_UTG | {"JJ","AQs"}
+GTO_3BET_VS_CO  = GTO_3BET_VS_MP  | {"TT","AQo","AJs","KQs","A5s","A4s"}
+GTO_3BET_VS_BTN = GTO_3BET_VS_CO  | {"99","KJs","AJo","KQo","A3s","A2s","T9s"}
+GTO_3BET_VS_SB  = GTO_3BET_VS_BTN
+
+_GTO_3BETS = {
+    "utg": GTO_3BET_VS_UTG,
+    "mp":  GTO_3BET_VS_MP,
+    "co":  GTO_3BET_VS_CO,
+    "btn": GTO_3BET_VS_BTN,
+    "sb":  GTO_3BET_VS_SB,
+}
+
+# === Calling ranges (call but not 3-bet) =======================================
+# Hands we just call to see the flop in position with playability.
+GTO_CALL_VS_UTG = {
+    "JJ","TT","99","88","77","66","55",
+    "AQs","AJs","ATs","KQs","KJs","KTs","QJs","QTs","JTs","T9s","98s","87s","76s",
+    "AQo","AJo","KQo",
+}
+GTO_CALL_VS_MP = GTO_CALL_VS_UTG | {
+    "44","33","22","A9s","A8s","A7s","A6s","A5s","A4s","A3s","A2s","K9s","Q9s","J9s",
+}
+GTO_CALL_VS_CO = GTO_CALL_VS_MP | {
+    "K8s","Q8s","J8s","T8s","97s","86s","75s","65s","54s","ATo","KJo","QJo",
+}
+GTO_CALL_VS_BTN = GTO_CALL_VS_CO | {
+    "K7s","K6s","K5s","Q7s","J7s","T7s","96s","85s","74s","64s","53s","43s",
+    "A9o","K9o","Q9o","J9o","T9o","98o","KJo","QJo",
+}
+GTO_CALL_VS_SB = GTO_CALL_VS_BTN
+
+_GTO_CALLS = {
+    "utg": GTO_CALL_VS_UTG,
+    "mp":  GTO_CALL_VS_MP,
+    "co":  GTO_CALL_VS_CO,
+    "btn": GTO_CALL_VS_BTN,
+    "sb":  GTO_CALL_VS_SB,
+}
+
+# === BB defending ranges =======================================================
+# When facing a raise from BB (after posting), we defend wide due to discount.
+# Combined call+3bet defend.  3-bet ranges are subset of GTO_3BETS by opener pos.
+GTO_BB_CALL_VS_UTG = GTO_CALL_VS_UTG | {
+    "44","33","22","A9s","A8s","A7s","A6s","A5s","A4s","A3s","A2s",
+    "K9s","K8s","Q9s","J9s","T8s","97s","86s","65s","54s",
+    "ATo","KJo","KTo","QJo","QTo","JTo",
+}
+GTO_BB_CALL_VS_BTN = GTO_BB_CALL_VS_UTG | {
+    "K7s","K6s","K5s","K4s","K3s","K2s","Q8s","Q7s","Q6s","Q5s",
+    "J8s","J7s","T7s","96s","85s","75s","64s","53s","43s",
+    "A9o","A8o","A7o","A6o","A5o","A4o","A3o","A2o","K9o","K8o",
+    "Q9o","J9o","T9o","98o","87o","76o",
+}
+_GTO_BB_DEFENDS = {
+    "utg": GTO_BB_CALL_VS_UTG,
+    "mp":  GTO_BB_CALL_VS_UTG,
+    "co":  GTO_BB_CALL_VS_BTN,         # CO and BTN: similar wide defending
+    "btn": GTO_BB_CALL_VS_BTN,
+    "sb":  GTO_BB_CALL_VS_BTN,
+}
+
+# === 4-bet response ranges (facing a 3-bet) ===================================
+# Versus a 3-bet, we 4-bet only premium / call with strong / fold rest.
+GTO_4BET = {"AA","KK"}
+GTO_CALL_3BET = {"QQ","JJ","AKs","AKo"}      # standard call-3bet range
+GTO_CALL_3BET_DEEP = GTO_CALL_3BET | {       # only deep stacks add these
+    "TT","AQs","AQo","AJs","KQs",
+}
+
+
+def _gto_position_label(state) -> str:
+    """Determine our position label (utg/mp/co/btn/sb/bb) from action_log.
+    Returns 'unknown' if we can't infer it."""
+    action_log = state.get("action_log", [])
+    your_seat = state["seat_to_act"]
+    sb_seat = next((a["seat"] for a in action_log
+                    if a.get("action") == "small_blind"), None)
+    if sb_seat is None:
+        return "unknown"
+    seats_in_hand = sorted({p["seat"] for p in state["players"]
+                            if p.get("state") != "busted"})
+    n = len(seats_in_hand)
+    if n < 2:
+        return "unknown"
+    if n == 2:
+        return "btn" if your_seat == sb_seat else "bb"
+
+    # Dealer = SB - 1 in seat order around the table
+    if sb_seat in seats_in_hand:
+        sb_idx = seats_in_hand.index(sb_seat)
+        dealer = seats_in_hand[(sb_idx - 1) % n]
+    else:
+        return "unknown"
+    if your_seat not in seats_in_hand:
+        return "unknown"
+    your_idx = seats_in_hand.index(your_seat)
+    dealer_idx = seats_in_hand.index(dealer)
+    offset = (your_idx - dealer_idx) % n
+    # offset 0=BTN, 1=SB, 2=BB, 3=UTG, 4=MP/HJ, 5=CO (in 6-max)
+    if offset == 0: return "btn"
+    if offset == 1: return "sb"
+    if offset == 2: return "bb"
+    if offset == n - 1: return "co"
+    if offset >= 3 and offset <= n - 2:
+        # MP or UTG
+        if n >= 5 and offset == 3:
+            return "utg"
+        return "mp"
+    return "unknown"
+
+
+def _gto_opener_position(state):
+    """Find the position of the most recent preflop raiser.  Returns
+    'unknown' if we can't pin it down."""
+    action_log = state.get("action_log", [])
+    last_raiser = None
+    for a in action_log:
+        if a.get("action") in ("raise", "all_in"):
+            last_raiser = a.get("seat")
+    if last_raiser is None:
+        return "unknown"
+    sb_seat = next((a["seat"] for a in action_log
+                    if a.get("action") == "small_blind"), None)
+    if sb_seat is None:
+        return "unknown"
+    seats_in_hand = sorted({p["seat"] for p in state["players"]
+                            if p.get("state") != "busted"})
+    n = len(seats_in_hand)
+    if n < 2 or last_raiser not in seats_in_hand or sb_seat not in seats_in_hand:
+        return "unknown"
+    if n == 2:
+        return "btn" if last_raiser == sb_seat else "bb"
+    sb_idx = seats_in_hand.index(sb_seat)
+    dealer = seats_in_hand[(sb_idx - 1) % n]
+    raiser_idx = seats_in_hand.index(last_raiser)
+    dealer_idx = seats_in_hand.index(dealer)
+    offset = (raiser_idx - dealer_idx) % n
+    if offset == 0: return "btn"
+    if offset == 1: return "sb"
+    if offset == 2: return "bb"
+    if offset == n - 1: return "co"
+    if offset >= 3 and offset <= n - 2:
+        if n >= 5 and offset == 3:
+            return "utg"
+        return "mp"
+    return "unknown"
+
+
+def _gto_recommendation(state):
+    """Look up the GTO action for the current preflop spot.
+
+    Returns one of:
+      ('open',)              — open-raise as RFI
+      ('3bet',)              — 3-bet vs single open
+      ('4bet',)              — 4-bet vs 3-bet
+      ('call',)              — flat call vs raise
+      ('check',)             — BB checks the option
+      ('fold',)              — fold
+      None                   — situation not covered, fall back to old logic
+    """
+    if state.get("street") != "preflop":
+        return None
+
+    cards = state["your_cards"]
+    if len(cards) != 2:
+        return None
+    hand = _canonical_hand(cards[0], cards[1])
+    our_pos = _gto_position_label(state)
+    if our_pos == "unknown":
+        return None
+
+    raised_count = sum(1 for a in state["action_log"]
+                       if a.get("action") in ("raise", "all_in"))
+    can_check = state["can_check"]
+
+    if raised_count == 0:
+        # RFI / check option
+        if our_pos == "bb" and can_check:
+            return ("check",)
+        opens = _GTO_OPENS.get(our_pos)
+        if opens is None:
+            return None
+        if hand in opens:
+            return ("open",)
+        return ("fold",)
+
+    if raised_count == 1:
+        opener_pos = _gto_opener_position(state)
+        if opener_pos == "unknown":
+            return None
+        # BB defending — uses widened defend range
+        if our_pos == "bb":
+            threebets = _GTO_3BETS.get(opener_pos)
+            defends = _GTO_BB_DEFENDS.get(opener_pos)
+            if threebets and hand in threebets:
+                return ("3bet",)
+            if defends and hand in defends:
+                return ("call",)
+            return ("fold",)
+        # Non-BB facing a raise
+        threebets = _GTO_3BETS.get(opener_pos)
+        calls = _GTO_CALLS.get(opener_pos)
+        if threebets and hand in threebets:
+            return ("3bet",)
+        if calls and hand in calls:
+            return ("call",)
+        return ("fold",)
+
+    if raised_count >= 2:
+        # Facing a 3-bet (or larger)
+        if hand in GTO_4BET:
+            return ("4bet",)
+        if hand in GTO_CALL_3BET:
+            return ("call",)
+        return ("fold",)
+
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Range infrastructure — for conditioning Monte Carlo on opponent action.
 # A "range" is a list of hand_keys (canonical 169-form).  Combos are the
 # concrete (c1, c2) tuples consistent with those keys.
@@ -478,6 +755,8 @@ def _reset_match_state():
     _self_pnl.clear()
     _opp_sig.clear()
     _opp_sig_total.clear()
+    _spot_pnl.clear()
+    _pending_spots.clear()
     _last_log_anchor = None
     _self_pnl_state["last_stack"] = None
     _self_pnl_state["last_hand"] = None
@@ -1053,6 +1332,9 @@ def _update_self_pnl(state):
             share = delta / len(last_in)
             for bid in last_in:
                 _self_pnl[bid] = _self_pnl.get(bid, 0) + share
+        # Also flush #9 per-spot tracker — distribute the same delta across
+        # whichever spots we played in the previous hand.
+        _flush_pending_spots(delta)
 
     # Record current hand's opponents (for future attribution)
     in_hand_now = {p["bot_id"] for p in state["players"]
@@ -1066,6 +1348,66 @@ def _update_self_pnl(state):
 
 def _opp_self_pnl(bot_id) -> float:
     return _self_pnl.get(bot_id, 0.0)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# #9 — Online per-spot P&L tracker (passive, no decision biasing yet)
+#
+# Original Tier-3 spec called for an online classifier that predicts opponent
+# ranges from observed outcomes.  But the runner only delivers `warmup` and
+# `action_request` states to bots — never `hand_complete` or showdown
+# reveals.  So we cannot actually observe opponent hands.
+#
+# What we *can* observe: our own chip delta when a hand ends.  This tracker
+# attributes that delta to coarse "spot signatures" we encountered (e.g.
+# "flop bet vs single opp on wet board").  Over enough hands the running
+# average becomes useful for diagnosing leaky spots.
+#
+# Currently *not wired into decisions* — both #7 (GTO blueprint) and the
+# minimal #8 line awareness regressed when biasing decisions on this kind
+# of data.  Kept as data infrastructure: future improvements (e.g.
+# offline analysis, per-bot tuning between matches) can read these stats.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_spot_pnl = {}                  # spot_sig -> [sum_pnl, count]
+_pending_spots = set()          # spots from this hand, attributed at hand-end
+
+
+def _spot_signature(state, action_kind: str) -> tuple:
+    """Coarse description of the current spot we just took an action in.
+    Tuple of (street, action_kind, n_active_opps, board_wetness_bucket)."""
+    n_opp = _n_active_opponents(state)
+    wet = _board_wetness(state.get("community_cards") or [])
+    return (state.get("street", "?"), action_kind, min(n_opp, 3),
+            "dry" if wet == 0 else "wet")
+
+
+def _record_my_spot(state, action_kind: str):
+    """Note that I just took `action_kind` in this spot.  At hand-end the
+    chip delta is attributed equally across all spots I encountered."""
+    sig = _spot_signature(state, action_kind)
+    _pending_spots.add(sig)
+
+
+def _flush_pending_spots(pnl_delta: float):
+    """Distribute a hand's chip delta evenly across the spots played."""
+    if not _pending_spots:
+        return
+    share = pnl_delta / len(_pending_spots)
+    for sig in _pending_spots:
+        cur = _spot_pnl.get(sig, [0.0, 0])
+        cur[0] += share
+        cur[1] += 1
+        _spot_pnl[sig] = cur
+    _pending_spots.clear()
+
+
+def _spot_avg_pnl(sig):
+    """Mean P&L for this spot, or None when sample too small."""
+    bucket = _spot_pnl.get(sig)
+    if bucket is None or bucket[1] < 5:
+        return None
+    return bucket[0] / bucket[1]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1417,6 +1759,8 @@ def _maybe_reset_for_new_match(state):
         _self_pnl.clear()
         _opp_sig.clear()
         _opp_sig_total.clear()
+        _spot_pnl.clear()
+        _pending_spots.clear()
         _last_log_anchor = None
         _self_pnl_state["last_stack"] = None
         _self_pnl_state["last_hand"] = None
@@ -1571,9 +1915,17 @@ def decide(game_state: dict) -> dict:
     if game_state.get("type") == "warmup":
         return {"ok": True}
     try:
-        return _decide(game_state)
+        result = _decide(game_state)
     except Exception:
         return {"action": "fold"}
+    # #9 — record our spot for the per-spot P&L tracker.  Best-effort: a
+    # bug in the tracker must never affect the action we return.
+    try:
+        action_kind = (result.get("action", "fold") or "fold").lower()
+        _record_my_spot(game_state, action_kind)
+    except Exception:
+        pass
+    return result
 
 
 def _decide(state):
@@ -1671,7 +2023,8 @@ def _preflop_decision(state, n_opp, pos, is_late, is_early, is_hu,
     # 3-bet+ pots: tighten further
     facing_three_bet = raised_count >= 2
 
-    # Stack-based push/fold for very short stacks
+    # Stack-based push/fold for very short stacks (overrides GTO blueprint —
+    # GTO charts are calibrated for ~100bb stacks, irrelevant when shoving)
     if stack <= 12 * BIG_BLIND and owed > 0:
         push_eq = 0.45 if is_hu else 0.55
         if eq_hu >= push_eq or hand in ("AA", "KK", "QQ", "JJ", "TT", "AKs", "AKo", "AQs"):
@@ -1681,6 +2034,38 @@ def _preflop_decision(state, n_opp, pos, is_late, is_early, is_hu,
         if pot_odds > 0 and eq_multi > pot_odds + 0.06:
             return {"action": "call"}
         return {"action": "fold"}
+
+    # ---------------- GTO blueprint (#7) -----------------------------------
+    # Try the published 6-max GTO chart first.  Falls through to the existing
+    # logic when the situation is unusual (multi-way limps, deep 4-bet pots,
+    # missing position info).  HU is handled by its own branch below since
+    # GTO 6-max charts don't apply.
+    if _USE_GTO_BLUEPRINT and not is_hu and stack >= 30 * BIG_BLIND:
+        rec = _gto_recommendation(state)
+        if rec is not None:
+            n_callers = sum(1 for a in state["action_log"]
+                            if a.get("action") == "call")
+            open_size = (3 * BIG_BLIND) + (BIG_BLIND * max(0, n_callers))
+            open_size = max(open_size, min_raise_to)
+            current_bet = state["current_bet"]
+            kind = rec[0]
+            if kind == "open":
+                return _make_raise(open_size, state)
+            if kind == "3bet":
+                threebet_to = max(min_raise_to, int(current_bet * 3.0))
+                return _make_raise(threebet_to, state)
+            if kind == "4bet":
+                fourbet_to = max(min_raise_to, int(current_bet * 2.5))
+                return _make_raise(fourbet_to, state)
+            if kind == "call":
+                return {"action": "call"}
+            if kind == "check":
+                return {"action": "check"} if can_check else {"action": "fold"}
+            if kind == "fold":
+                # BB checking option overrides "fold" if available
+                if can_check:
+                    return {"action": "check"}
+                return {"action": "fold"}
 
     # ---------------- Heads-up specialization ------------------------------
     # In HU, ranges should be MUCH wider — open ~70% on the button (SB),
@@ -2166,6 +2551,46 @@ def _board_wetness(board_strs):
     spread = ranks_idx[-1] - ranks_idx[0]
     straight_y = spread <= 4 and len(ranks_idx) >= 3
     return int(flush_draw) + int(straight_y)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# #8 — Multi-street line awareness
+#
+# Tracks our own aggression history this hand, lets later-street decisions
+# bias toward continuing the line we started.  Specifically: if we cbet flop,
+# our turn-bet threshold should be slightly lower (we're committed to telling
+# a coherent story rather than firing once and giving up — a known leak).
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _my_prev_street_aggression(state) -> bool:
+    """Return True if I (the seat-to-act) raised/bet on the most-recent
+    completed street.  Walks action_log, identifies streets via the same
+    state-machine as _replay_hand, and asks: was the seat-to-act among the
+    aggressors on whichever street is currently *over*?
+    """
+    your_seat = state["seat_to_act"]
+    cur_street = state["street"]
+    if cur_street == "preflop":
+        return False
+    actions = state.get("action_log", [])
+    if not actions:
+        return False
+    # Use replay to label each action's street, then pick previous street's
+    # aggressors.  This is cheap (~1 ms) and reuses the engine we already have.
+    target_street = {"flop": "preflop", "turn": "flop", "river": "turn"}[cur_street]
+    for entry, st, _pos, _pot, _tier in _replay_hand(actions):
+        if st == target_street and entry.get("seat") == your_seat \
+                and entry.get("action") in ("raise", "all_in"):
+            return True
+    return False
+
+
+def _my_raises_this_hand(state) -> int:
+    """Total times I've raised/all-in'd in this hand so far."""
+    your_seat = state["seat_to_act"]
+    return sum(1 for a in state.get("action_log", [])
+               if a.get("seat") == your_seat
+               and a.get("action") in ("raise", "all_in"))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
