@@ -23,6 +23,7 @@ BOT_AVATAR = "robot_1"
 
 BIG_BLIND = 100
 SMALL_BLIND = 50
+STARTING_STACK = 10_000   # tournament starting stack; used for bust-protection SPR
 
 RANK_ORDER = "23456789TJQKA"
 _RANK_IDX = {r: i for i, r in enumerate(RANK_ORDER)}
@@ -134,7 +135,7 @@ def _multiway_equity(hand_key: str, n_opp: int) -> float:
     if eq is not None:
         return eq
     e = _HU_EQUITY.get(hand_key, 0.40)
-    return e ** (1.0 + (n_opp - 1) * 0.55)
+    return e ** (1.0 + (n_opp - 1) * 0.82)
 
 
 def _representative_cards(hand_key: str):
@@ -1234,11 +1235,33 @@ def _classify_archetypes():
     """(Re-)label each opponent with a coarse archetype tag."""
     for bid, d in _deep.items():
         total = sum(d["street_n"].values())
-        if total < 12:
-            _archetype[bid] = "unknown"
+        pf_n = d["street_n"]["preflop"]
+        pf_raise = d["street_raise"]["preflop"] / max(pf_n, 1)
+
+        # Early maniac signal: ≥4 PF actions, ≥80% raise rate.
+        # Don't wait for the full 12-action threshold — by then we've already
+        # lost chips before applying wide defense.
+        if pf_n >= 4 and pf_raise >= 0.80:
+            _archetype[bid] = "maniac"
             continue
-        pf_raise = d["street_raise"]["preflop"] / max(d["street_n"]["preflop"], 1)
-        pf_fold = d["street_fold"]["preflop"] / max(d["street_n"]["preflop"], 1)
+
+        # Bootstrap from rolling model when deep data is still thin.
+        # Uses coarser raise/fold freq from the match-action-log model.
+        if total < 12:
+            profile = _opp_profile(bid)
+            roll_raise, roll_fold, _, roll_n = profile
+            if roll_n >= 5:
+                if roll_raise >= 0.65:
+                    _archetype[bid] = "maniac"
+                elif roll_fold >= 0.65:
+                    _archetype[bid] = "nit"
+                else:
+                    _archetype[bid] = "unknown"
+            else:
+                _archetype[bid] = "unknown"
+            continue
+
+        pf_fold = d["street_fold"]["preflop"] / max(pf_n, 1)
         post_n = d["street_n"]["flop"] + d["street_n"]["turn"] + d["street_n"]["river"]
         post_raise = (d["street_raise"]["flop"] + d["street_raise"]["turn"]
                       + d["street_raise"]["river"]) / max(post_n, 1)
@@ -1248,6 +1271,12 @@ def _classify_archetypes():
                      + d["street_call"]["river"]) / max(post_n, 1)
 
         # Order matters — earliest match wins.
+        # Overbet archetype: most bets are 85%+ pot sized
+        total_raises = sum(d["size_hist"].values())
+        big_bets = d["size_hist"].get("overbet", 0) + d["size_hist"].get("huge", 0)
+        if total_raises >= 6 and big_bets / total_raises >= 0.50:
+            _archetype[bid] = "overbet"
+            continue
         if pf_raise > 0.55 or post_raise > 0.55:
             _archetype[bid] = "maniac"
         elif pf_fold > 0.70 and pf_raise < 0.10:
@@ -1279,25 +1308,39 @@ def _archetype_counters(archetype: str) -> dict:
     * 'open_threshold_delta' — added to preflop open thresholds (medium effect)
     """
     if archetype == "maniac":
-        # Calls down with junk, never folds — never bluff, slightly wider value
-        return {"value_eq_delta": -0.02, "call_eq_delta": -0.02,
-                "bluff_freq_mult": 0.0, "open_threshold_delta": 0.0}
+        # Never folds → never bluff; open tighter to reduce pot exposure.
+        # Neutral deltas: their range IS wide so calling is fine, but don't
+        # loosen thresholds — we need to avoid marginal all-in commits.
+        return {"value_eq_delta": 0.0, "call_eq_delta": 0.0,
+                "bluff_freq_mult": 0.0, "open_threshold_delta": +0.05,
+                "three_bet_defense_wide": True, "value_size_mult": 1.05}
+    if archetype == "overbet":
+        # Overbets everything — range is wide, NOT polarized.  Call wider,
+        # raise for value with any made hand, never fold to size alone.
+        return {"value_eq_delta": -0.04, "call_eq_delta": -0.04,
+                "bluff_freq_mult": 0.0, "open_threshold_delta": 0.0,
+                "three_bet_defense_wide": False, "value_size_mult": 1.0}
     if archetype == "nit":
-        # Folds to anything → bluff more, slightly fold to their aggression
+        # Folds to anything → bluff more; smaller value bets to keep them in
         return {"value_eq_delta": +0.03, "call_eq_delta": +0.025,
-                "bluff_freq_mult": 1.6, "open_threshold_delta": -0.04}
+                "bluff_freq_mult": 1.6, "open_threshold_delta": -0.04,
+                "three_bet_defense_wide": False, "value_size_mult": 0.80}
     if archetype == "station":
-        # Calls wide → value bet wider, never bluff
-        return {"value_eq_delta": -0.02, "call_eq_delta": 0.0,
-                "bluff_freq_mult": 0.1, "open_threshold_delta": 0.0}
+        # Calls wide → bet 1.0–1.2× pot for value, never bluff
+        return {"value_eq_delta": -0.05, "call_eq_delta": 0.0,
+                "bluff_freq_mult": 0.0, "open_threshold_delta": 0.0,
+                "three_bet_defense_wide": False, "value_size_mult": 1.20}
     if archetype == "lag":
         return {"value_eq_delta": 0.0, "call_eq_delta": -0.01,
-                "bluff_freq_mult": 0.7, "open_threshold_delta": 0.0}
+                "bluff_freq_mult": 0.7, "open_threshold_delta": 0.0,
+                "three_bet_defense_wide": False, "value_size_mult": 1.0}
     if archetype == "tag":
         return {"value_eq_delta": +0.01, "call_eq_delta": +0.01,
-                "bluff_freq_mult": 0.85, "open_threshold_delta": 0.0}
+                "bluff_freq_mult": 0.85, "open_threshold_delta": 0.0,
+                "three_bet_defense_wide": False, "value_size_mult": 1.0}
     return {"value_eq_delta": 0.0, "call_eq_delta": 0.0,
-            "bluff_freq_mult": 1.0, "open_threshold_delta": 0.0}
+            "bluff_freq_mult": 1.0, "open_threshold_delta": 0.0,
+            "three_bet_defense_wide": False, "value_size_mult": 1.0}
 
 
 def _aggregated_counters(in_hand_bot_ids):
@@ -1403,9 +1446,11 @@ def _flush_pending_spots(pnl_delta: float):
 
 
 def _spot_avg_pnl(sig):
-    """Mean P&L for this spot, or None when sample too small."""
+    """Mean P&L for this spot, or None when sample too small.
+    Minimum 30 samples required to reduce variance-driven drift.
+    """
     bucket = _spot_pnl.get(sig)
-    if bucket is None or bucket[1] < 5:
+    if bucket is None or bucket[1] < 30:
         return None
     return bucket[0] / bucket[1]
 
@@ -1776,6 +1821,28 @@ def _update_deep_profile(state):
     _update_self_pnl(state)
 
 
+def _tournament_pressure(state) -> float:
+    """Return a stack-pressure multiplier in [0.75, 1.25].
+    > 1.0 means we have chips to spare and should apply pressure;
+    < 1.0 means we are short and should tighten commit thresholds."""
+    players = state.get("players", [])
+    stacks = [p.get("stack", 0) for p in players
+              if p.get("state") != "busted" and p.get("stack", 0) > 0]
+    if len(stacks) < 2:
+        return 1.0
+    avg = sum(stacks) / len(stacks)
+    if avg <= 0:
+        return 1.0
+    your_seat = state["seat_to_act"]
+    me = next((p for p in players if p["seat"] == your_seat), None)
+    if me is None:
+        return 1.0
+    ratio = me.get("stack", avg) / avg
+    # ratio > 1 → big stack → pressure multiplier > 1 (loosen)
+    # ratio < 1 → short stack → pressure multiplier < 1 (tighten)
+    return max(0.75, min(1.25, 0.75 + 0.50 * ratio))
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Mixed strategies — sigmoid for smoothing hard equity cliffs
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1845,10 +1912,10 @@ def _implied_pot_odds(pot: int, owed: int, tier: str, draw: str,
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _position_score(state):
-    """Return a 0..1 lateness score where 1.0 means last to act this street."""
+    """Return a 0..1 lateness score where 1.0 means last to act this street.
+    Uses sorted active seat list so sparse seat numbers don't break position."""
     your_seat = state["seat_to_act"]
     players = state["players"]
-    n = len(players)
 
     def is_active(p):
         return (not p.get("is_folded")
@@ -1859,16 +1926,18 @@ def _position_score(state):
     me = next((p for p in players if p["seat"] == your_seat), None)
     if me is None or not is_active(me):
         return 0.5
-    n_active = sum(1 for p in players if is_active(p))
+
+    active_seats = sorted(p["seat"] for p in players if is_active(p))
+    n_active = len(active_seats)
     if n_active <= 1:
         return 1.0
 
-    after = 0
-    for offset in range(1, n):
-        s = (your_seat + offset) % n
-        if is_active(players[s]):
-            after += 1
-    # Position score is fraction of active opponents who act before me.
+    my_idx = active_seats.index(your_seat) if your_seat in active_seats else -1
+    if my_idx < 0:
+        return 0.5
+
+    # Count how many active players act after me in seat order
+    after = n_active - 1 - my_idx
     return 1.0 - after / max(n_active - 1, 1)
 
 
@@ -1975,6 +2044,21 @@ def _decide(state):
     # Aggregate archetype counter hints across in-hand opponents (#6).
     counters = _aggregated_counters([p["bot_id"] for p in in_hand])
 
+    # Rolling-model early maniac override: if any in-hand opponent has a high
+    # raise rate from the match-log (≥5 samples, ≥72% raises) but the deep
+    # profiler hasn't classified them yet, blend maniac counters in immediately.
+    if in_hand and not any(_opp_archetype(p["bot_id"]) == "maniac" for p in in_hand):
+        mc = _archetype_counters("maniac")
+        for p in in_hand:
+            rf, _, _, sn = _opp_profile(p["bot_id"])
+            if sn >= 5 and rf >= 0.72:
+                for k, v in mc.items():
+                    if isinstance(v, bool):
+                        counters[k] = counters[k] or v
+                    else:
+                        counters[k] = (counters[k] + v) * 0.5
+                break
+
     # Pot odds (break-even equity).
     pot_odds = owed / (pot + owed) if owed > 0 else 0.0
     spr = stack / max(pot, 1)
@@ -2023,9 +2107,14 @@ def _preflop_decision(state, n_opp, pos, is_late, is_early, is_hu,
     # 3-bet+ pots: tighten further
     facing_three_bet = raised_count >= 2
 
+    # Squeeze spot: exactly one raise + ≥1 callers behind it.
+    # Callers' ranges are capped (no strong hand), so fold equity is huge.
+    n_callers_pre = sum(1 for a in state["action_log"] if a.get("action") == "call")
+    is_squeeze_spot = (raised_count == 1 and n_callers_pre >= 1)
+
     # Stack-based push/fold for very short stacks (overrides GTO blueprint —
     # GTO charts are calibrated for ~100bb stacks, irrelevant when shoving)
-    if stack <= 12 * BIG_BLIND and owed > 0:
+    if stack <= 17 * BIG_BLIND and owed > 0:
         push_eq = 0.45 if is_hu else 0.55
         if eq_hu >= push_eq or hand in ("AA", "KK", "QQ", "JJ", "TT", "AKs", "AKo", "AQs"):
             return {"action": "all_in"}
@@ -2132,32 +2221,71 @@ def _preflop_decision(state, n_opp, pos, is_late, is_early, is_hu,
         current_bet = state["current_bet"]
         threebet_to = max(min_raise_to, int(current_bet * 3.0))
 
+        # Squeeze: raise + ≥1 callers → enormous fold equity. Size to 4×+.
+        # Caller's range is capped (strong hands 3-bet), raiser opens wide.
+        if is_squeeze_spot and not facing_three_bet:
+            squeeze_size = max(min_raise_to,
+                               int(current_bet * (3.5 + 0.5 * n_callers_pre)))
+            # Squeeze only with hands that can comfortably call a 4-bet.
+            # JJ/TT/AQs create bloat-and-fold risk vs a strong 4-bet.
+            if hand in ("AA", "KK", "QQ", "AKs", "AKo"):
+                return _make_raise(squeeze_size, state)
+
         # Adjust thresholds based on opponent profile.  Aggressive openers have
         # wider ranges → we should call lighter and seldom 4-bet bluff.
         if aggro:
             call_eq = 0.50
         elif foldy:
-            call_eq = 0.55
+            call_eq = 0.58
         else:
             call_eq = 0.55
 
         # Facing a 3-bet (or larger) — premiums and strong calls only.
         if facing_three_bet:
-            # 4-bet/jam only AA/KK
-            if hand in ("AA", "KK"):
-                return _make_raise(threebet_to, state)
-            # Strong calls — flat with QQ/JJ/AKs/AKo even at deep cost
-            if hand in ("QQ", "JJ", "AKs", "AKo"):
-                if owed < 0.22 * stack:
-                    return {"action": "call"}
-            # Vs aggressive 3-bettor, expand range slightly
-            if aggro and hand in ("TT", "AQs", "AQo"):
-                if owed < 0.15 * stack:
-                    return {"action": "call"}
+            wide_defense = counters.get("three_bet_defense_wide", False)
+            # 4-bet/jam premiums — wider vs maniacs since their 3-bet range is huge.
+            # QQ/AKs: call rather than jam to keep pot manageable (~60% eq vs random).
+            if wide_defense:
+                if hand in ("AA", "KK"):
+                    return _make_raise(threebet_to, state)
+                if hand in ("QQ", "AKs"):
+                    if owed < 0.35 * stack:
+                        return {"action": "call"}
+                    return _make_raise(threebet_to, state)  # forced all-in size
+            else:
+                if hand in ("AA", "KK"):
+                    return _make_raise(threebet_to, state)
+            # Strong calls — flat with QQ/JJ/AKs/AKo vs normal; wider vs maniacs
+            if wide_defense:
+                if hand in ("JJ", "TT", "AKo", "AQs", "AQo", "AJs", "KQs"):
+                    if owed < 0.28 * stack:
+                        return {"action": "call"}
+                # Medium pairs and suited broadways — very profitable vs maniac 3-bets
+                if hand in ("99", "88", "77", "ATs", "KJs", "QJs"):
+                    if owed < 0.15 * stack:
+                        return {"action": "call"}
+            else:
+                if hand in ("QQ", "JJ", "AKs", "AKo"):
+                    if owed < 0.22 * stack:
+                        return {"action": "call"}
+                # Vs aggressive 3-bettor, expand range slightly
+                if aggro and hand in ("TT", "AQs", "AQo"):
+                    if owed < 0.15 * stack:
+                        return {"action": "call"}
             # Cheap pocket-pair set-mine in deep 3-bet pots
             if hand in ("TT", "99", "88", "77", "66", "55", "44", "33", "22"):
-                if owed < 0.05 * stack:
+                threshold = 0.10 if wide_defense else 0.05
+                if owed < threshold * stack:
                     return {"action": "call"}
+
+            # Cold 4-bet bluff: raise + call(s) + 3-bet means caller's range
+            # is capped (they'd have 3-bet strong hands), so 3-bettor's range
+            # is actually narrower.  Mix in 4-bet bluffs with blockers.
+            cold_4bet = n_callers_pre >= 1 and not wide_defense
+            if cold_4bet and hand in ("AQs", "KQs") and owed < 0.30 * stack:
+                if random.random() < 0.30:
+                    return _make_raise(threebet_to, state)
+
             return {"action": "fold"}
 
         # First 3-bet decision.
@@ -2210,7 +2338,7 @@ def _preflop_decision(state, n_opp, pos, is_late, is_early, is_hu,
     if is_late:
         threshold_open = 0.51       # ~top 35% of hands
     elif is_early:
-        threshold_open = 0.585      # ~top 12% of hands
+        threshold_open = 0.600      # ~top 8%; A7o/Q9o leak chips from EP
     else:
         threshold_open = 0.555      # ~top 22% of hands
 
@@ -2280,9 +2408,28 @@ def _postflop_decision(state, n_opp, pos, is_late, is_early, is_hu,
         cards, board, n_opp, time_budget=budget, opp_ranges=opp_ranges,
     )
 
+    any_maniac_in_hand = any(_opp_archetype(bid) == "maniac"
+                             for (_, bid) in in_hand_seats)
+
     # Reward-feedback caution: tighten thresholds against opponents we're
     # losing chips to (cumulatively), loosen against ones we're winning from.
     caution = _opp_caution_factor([bid for (_, bid) in in_hand_seats])
+    tp = _tournament_pressure(state)
+    # Blend tournament pressure into caution: big stacks loosen, short stacks tighten
+    caution = max(0.7, min(1.3, caution * (2.0 - tp)))
+
+    # Stack preservation mode: tighten all-in commit thresholds as stack
+    # shrinks to avoid tournament elimination on marginal spots.
+    # Smooth ICM curve: tightening begins at 80% stack, maxes out at 40%.
+    stack_ratio = stack / STARTING_STACK
+    preservation_mode = stack_ratio < 0.60  # kept for spr/sizing gates below
+    if stack_ratio >= 0.80:
+        preserve_equity_bonus = 0.0
+    elif stack_ratio >= 0.40:
+        # Linear ramp: 0.0 at 80% → 0.10 at 40%
+        preserve_equity_bonus = 0.10 * (0.80 - stack_ratio) / 0.40
+    else:
+        preserve_equity_bonus = 0.10
 
     # Hand classification — categorical strength + draw type.
     hc = _classify_postflop(cards, board)
@@ -2300,6 +2447,7 @@ def _postflop_decision(state, n_opp, pos, is_late, is_early, is_hu,
     am_aggressor = (last_aggressor_seat == state["seat_to_act"])
 
     wetness = _board_wetness(board)
+    btex = _board_texture(board)
 
     # NOTE: a separate `_river_decision` branch (MDF + combo counting + polar
     # value sizing) was tested here but rolled back — it improved the small
@@ -2308,11 +2456,19 @@ def _postflop_decision(state, n_opp, pos, is_late, is_early, is_hu,
     # adaptive sizing helpers still apply through the generic logic below.
     # Keeping the helper around for future reference; not invoked here.
 
+    vsm = min(1.30, counters.get("value_size_mult", 1.0))  # cap at 130% pot
+
     # ---------------- Can check? --------------------------------------------
     if can_check:
         # Strong hands (2 pair+) — bet for value almost always.
         if is_strong:
-            size_mult = 0.75 if (wetness or street == "river") else 0.65
+            if street == "river":
+                size_mult = 0.90 * vsm   # realize full value on river
+            elif wetness:
+                size_mult = 0.75 * vsm
+            else:
+                size_mult = 0.65 * vsm
+            size_mult = min(1.25, size_mult)
             return _make_raise(int(state["current_bet"] + pot * size_mult), state)
 
         # Top pair / overpair — value bet, but check-call vs aggressors to
@@ -2320,12 +2476,17 @@ def _postflop_decision(state, n_opp, pos, is_late, is_early, is_hu,
         if is_top_pair_plus:
             if aggro and n_opp == 1 and tier in ("tptk", "overpair"):
                 return {"action": "check"}
-            size_mult = 0.62 if not wetness else 0.70
+            if street == "river":
+                size_mult = 0.75 * vsm
+            else:
+                size_mult = (0.62 if not wetness else 0.70) * vsm
+            size_mult = min(1.20, size_mult)
             return _make_raise(int(state["current_bet"] + pot * size_mult), state)
 
         # Strong draw — semi-bluff probabilistically.
-        if has_strong_draw and not aggro and street != "river":
+        if has_strong_draw and street != "river":
             sb_prob = 0.55
+            if aggro:   sb_prob += 0.10   # re-raise folds aggro air; semi-bluff is good here
             if is_late: sb_prob += 0.15
             if foldy:   sb_prob += 0.15
             if n_opp >= 3: sb_prob -= 0.30
@@ -2336,14 +2497,31 @@ def _postflop_decision(state, n_opp, pos, is_late, is_early, is_hu,
         if is_made_pair_plus:
             return {"action": "check"}
 
+        # Probe bet (delayed cbet): we raised preflop, checked the flop, now on
+        # the turn.  Fire to represent continued strength and deny free cards.
+        if (street == "turn" and n_opp == 1
+                and _my_raises_this_hand(state) >= 1
+                and not _my_prev_street_aggression(state)   # checked flop
+                and equity >= 0.50 and not btex["paired"]):
+            probe_mult = 0.50 if equity < 0.56 else 0.62
+            return _make_raise(int(state["current_bet"] + pot * probe_mult), state)
+
+        # Thin value bet when MC says we're clearly ahead but hand has no tier match.
+        # Size proportional to edge — small with marginal, up to 60% pot with solid lead.
+        # Skip river (bet on river only when classified strong); skip multi-way (variance).
+        if equity >= 0.60 and street != "river" and n_opp == 1:
+            edge = equity - 0.50
+            size_mult = min(0.60, 0.38 + edge * 1.1)
+            return _make_raise(int(state["current_bet"] + pot * size_mult), state)
+
         # High-equity (per MC) but uncategorised — check to extract on later streets.
         if equity >= 0.55:
             return {"action": "check"}
 
-        # Pure bluff: HU vs wet boards, not river.  Use the opp's measured
-        # fold rate at the size we're about to bet — that's a much sharper
-        # signal than the generic `foldy` flag.
+        # Pure bluff: HU vs wet boards, not river.  Suppressed on paired boards
+        # (opp may have flopped trips/FH) and monotone boards (flush likely out).
         if (is_late and wetness
+                and not btex["paired"] and not btex["monotone"]
                 and street != "river" and n_opp == 1
                 and not aggro):
             target_bet = int(pot * 0.55)
@@ -2353,9 +2531,13 @@ def _postflop_decision(state, n_opp, pos, is_late, is_early, is_hu,
                            and not p.get("is_folded")
                            and p.get("state") != "busted"]
             f_rate = _avg_opp_fold_to_size(in_hand_ids, bet_tier)
-            if f_rate is not None and f_rate >= 0.55:
-                # Bluff probability scales with measured fold rate.
-                bluff_prob = min(0.90, f_rate)
+            if f_rate is not None:
+                target_bet_ev = int(pot * 0.55)
+                bluff_ev = f_rate * pot - (1 - f_rate) * target_bet_ev
+                if bluff_ev > 0 and f_rate >= 0.50:
+                    bluff_prob = min(0.90, f_rate)
+                else:
+                    bluff_prob = 0.0
             elif foldy:
                 # No exact fold-to-size data — fall back to old heuristic.
                 bluff_prob = 0.70 + (0.05 if avg_fold > 0.65 else 0.0)
@@ -2402,22 +2584,30 @@ def _postflop_decision(state, n_opp, pos, is_late, is_early, is_hu,
     pot_odds_eff = _implied_pot_odds(pot, owed, tier, hc["draw"], stack, n_opp)
 
     # Commit thresholds — strong hands jam, weak ones never.
-    if is_strong and spr <= 3.0:
+    # In preservation mode, require higher equity to avoid busting on marginal spots.
+    # Vs maniacs: tighten SPR gate (1.5 not 3.0) and equity jam gate (0.80 not 0.72)
+    # to avoid busting on marginal ~60% equity all-ins against volatile wide ranges.
+    commit_strong_spr = (1.5 if any_maniac_in_hand
+                         else (3.0 if not preservation_mode else 1.5))
+    commit_eq_hi     = 0.80 + preserve_equity_bonus
+    commit_eq_lo     = 0.72 + preserve_equity_bonus
+
+    if is_strong and spr <= commit_strong_spr:
         return {"action": "all_in"}
-    if is_strong and spr <= 5.0 and n_opp <= 2:
+    if is_strong and spr <= 5.0 and n_opp <= 2 and not preservation_mode:
         size_mult = 0.85
         target = state["current_bet"] + int(pot * size_mult)
         return _make_raise(target, state)
-    if equity >= 0.80 and spr <= 2.5:
+    if equity >= commit_eq_hi and spr <= 2.5:
         return {"action": "all_in"}
-    if equity >= 0.72 and spr <= 1.5 and n_opp <= 2 and not facing_reraise:
+    equity_jam_lo = commit_eq_hi if any_maniac_in_hand else commit_eq_lo
+    if equity >= equity_jam_lo and spr <= 1.5 and n_opp <= 2 and not facing_reraise:
         return {"action": "all_in"}
 
     # Facing a re-raise on the same street — opponent's range narrows hard.
     if facing_reraise:
-        # With sets+/two pair, ignore the tightening — we have it.
         if is_strong:
-            if equity >= 0.70 and street != "river":
+            if equity >= 0.70 + preserve_equity_bonus and street != "river":
                 size_mult = 0.85
                 return _make_raise(state["current_bet"] + int(pot * size_mult), state)
             return {"action": "call"}
@@ -2442,23 +2632,48 @@ def _postflop_decision(state, n_opp, pos, is_late, is_early, is_hu,
             return {"action": "fold"}
         return {"action": "call"}
 
-    # Huge bet awareness — opponent's range is polarised.  Strong hands
-    # snap-call/raise; bluff catchers call selectively; junk folds.
+    # Huge bet awareness.
+    # If the raiser is a known overbet-archetype (bets huge with wide range),
+    # treat as a normal wide-range bet — call with standard equity edge.
+    # Otherwise treat as polarized and require stronger hands.
     if huge_bet:
-        if is_strong:
-            pass  # fall through to value logic
-        elif is_top_pair_plus and owed < 0.30 * stack and equity >= pot_odds_eff + 0.05:
-            return {"action": "call"}
-        elif has_strong_draw and owed < 0.18 * stack and street != "river":
-            return {"action": "call"}
+        last_raiser_bid_arch = _opp_archetype(last_raiser_bid) if last_raiser_bid else "unknown"
+        opp_is_overbet_type = (last_raiser_bid_arch == "overbet")
+        if opp_is_overbet_type:
+            # Range is wide, not polarized — call with any positive equity edge
+            # over pot odds (same as standard call zone but applied here early).
+            edge_vs_overbet = equity - pot_odds_eff
+            if edge_vs_overbet >= margin_thin - 0.02:
+                pass  # fall through to standard value/call logic below
+            else:
+                return {"action": "fold"}
         else:
-            return {"action": "fold"}
+            # Genuinely polarized overbet — strong hands call/raise, rest fold.
+            if is_strong:
+                pass  # fall through to value logic
+            elif is_top_pair_plus and owed < 0.30 * stack and equity >= pot_odds_eff + 0.05:
+                return {"action": "call"}
+            elif has_strong_draw and owed < 0.18 * stack and street != "river":
+                return {"action": "call"}
+            else:
+                return {"action": "fold"}
 
     # Big-commit / overbet awareness for the standard case.
     if big_commit or overbet:
         if not (is_strong or is_top_pair_plus or has_strong_draw):
-            required = pot_odds_eff + 0.08
+            # Known aggro/maniac/overbet archetypes genuinely bet wide — need more edge to call.
+            # Unclassified opponents (e.g., equity-aware bots) size proportionally, not polarized;
+            # treat their overbets with the same thin margin as normal bets.
+            last_raiser_arch = _opp_archetype(last_raiser_bid) if last_raiser_bid else "unknown"
+            fold_margin = 0.08 if last_raiser_arch in ("maniac", "lag", "overbet") else 0.04
+            required = pot_odds_eff + fold_margin
             if equity < required:
+                return {"action": "fold"}
+        # Vs maniacs, TPTK alone isn't enough to call a big bet — their range
+        # is wide but we're risking a large stack fraction with ~65% equity.
+        # Require a real edge (12%) before committing chips with top pair only.
+        if any_maniac_in_hand and is_top_pair_plus and not is_strong:
+            if equity < pot_odds_eff + 0.12:
                 return {"action": "fold"}
 
     # Bluff-raise vs small bet from a foldy player (float spot).
@@ -2475,8 +2690,12 @@ def _postflop_decision(state, n_opp, pos, is_late, is_early, is_hu,
                        and not p.get("is_folded")
                        and p.get("state") != "busted"]
         f_rate = _avg_opp_fold_to_size(in_hand_ids, raise_tier)
-        if f_rate is not None and f_rate >= 0.55:
-            bluff_p = min(0.85, f_rate) * counters.get("bluff_freq_mult", 1.0)
+        if f_rate is not None:
+            bluff_ev = f_rate * pot - (1 - f_rate) * raise_target
+            if bluff_ev > 0 and f_rate >= 0.50:
+                bluff_p = min(0.85, f_rate) * counters.get("bluff_freq_mult", 1.0)
+            else:
+                bluff_p = 0.0
         elif foldy:
             bluff_p = 0.45 * counters.get("bluff_freq_mult", 1.0)
         else:
@@ -2485,12 +2704,33 @@ def _postflop_decision(state, n_opp, pos, is_late, is_early, is_hu,
             target = state["current_bet"] + raise_target
             return _make_raise(target, state)
 
+    # Semi-bluff check-raise with strong draws vs high-cbet opponents.
+    # A high-cbet bot fires air on the flop frequently; raising them with a draw
+    # takes the pot immediately or builds equity when called.
+    if (has_strong_draw and not facing_reraise and not huge_bet
+            and n_opp == 1 and street != "river"
+            and owed < 0.25 * stack and not btex["monotone"]):
+        in_hand_ids_cr = [p["bot_id"] for p in state["players"]
+                          if p["seat"] != state["seat_to_act"]
+                          and not p.get("is_folded")
+                          and p.get("state") != "busted"]
+        avg_cbet_cr = None
+        if in_hand_ids_cr:
+            cbets_cr = [_opp_cbet_freq(bid) for bid in in_hand_ids_cr]
+            cbets_cr = [c for c in cbets_cr if c is not None]
+            if cbets_cr:
+                avg_cbet_cr = sum(cbets_cr) / len(cbets_cr)
+        if avg_cbet_cr is not None and avg_cbet_cr >= 0.65:
+            cr_size = max(min_raise_to, int((pot + owed) * 2.2))
+            if cr_size <= stack:
+                return _make_raise(cr_size, state)
+
     # Apply archetype counters to call/raise thresholds (#6).
     # caution > 1 → losing to these opps → tighten (subtract less / add more)
     # caution < 1 → winning from these opps → loosen
     value_delta = counters.get("value_eq_delta", 0.0)
     call_delta = counters.get("call_eq_delta", 0.0)
-    caution_shift = (caution - 1.0) * 0.04   # max ±0.012 effect
+    caution_shift = (caution - 1.0) * 0.09   # max ±0.027 effect
 
     if equity >= pot_odds + margin_strong + call_delta + caution_shift:
         min_raise_eq = 0.58 + value_delta + caution_shift
@@ -2526,7 +2766,7 @@ def _postflop_decision(state, n_opp, pos, is_late, is_early, is_hu,
     # MC-noise flip-flops and is harder for opponents to read.  Probability
     # of calling rises smoothly through the [pot_odds, pot_odds+margin_thin]
     # band when the call is cheap.
-    if owed < 0.08 * stack and edge >= -0.02:
+    if owed < 0.08 * stack and edge >= 0.0:
         if random.random() < _smooth_p(edge, margin_thin / 2, sharpness=40.0):
             return {"action": "call"}
 
@@ -2551,6 +2791,27 @@ def _board_wetness(board_strs):
     spread = ranks_idx[-1] - ranks_idx[0]
     straight_y = spread <= 4 and len(ranks_idx) >= 3
     return int(flush_draw) + int(straight_y)
+
+
+def _board_texture(board_strs):
+    """Extended board classification used to gate bluffing and size value bets.
+
+    Returns a dict:
+      paired   — board has a pair (reduces bluff credibility; opp may have trips)
+      monotone — all visible cards same suit (flush almost always out there)
+      wet      — _board_wetness score (0/1/2)
+      dry      — no draws, no pair, not monotone
+    """
+    if len(board_strs) < 3:
+        return {"paired": False, "monotone": False, "wet": 0, "dry": True}
+    ranks = [c[0] for c in board_strs]
+    suits = [c[1] for c in board_strs]
+    paired = len(ranks) != len(set(ranks))
+    max_suit_n = max(suits.count(s) for s in set(suits))
+    monotone = (max_suit_n == len(board_strs))
+    wet = _board_wetness(board_strs)
+    dry = (wet == 0 and not paired and not monotone)
+    return {"paired": paired, "monotone": monotone, "wet": wet, "dry": dry}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2656,7 +2917,7 @@ def _classify_postflop(hole_strs, board_strs):
                 if paired_idx == sorted_board[0]:
                     other = hole_ranks[1] if hole_ranks[0] == paired else hole_ranks[0]
                     kicker = _RANK_IDX[other]
-                    tier = "tptk" if kicker >= _RANK_IDX["T"] else "tp_weak"
+                    tier = "tptk" if kicker >= _RANK_IDX["J"] else "tp_weak"
                 elif len(sorted_board) > 1 and paired_idx == sorted_board[1]:
                     tier = "mid_pair"
                 else:

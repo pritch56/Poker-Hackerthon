@@ -13,6 +13,8 @@ CLAUDE.local.md
 .continue/
 .codeium/
 
+fullhouse-engine/bots/mybot/bot.py
+
 # Renamed inner upstream clone — kept on disk for reference, excluded from
 # this repo so we never push uzlez/fullhouse-engine internals here.
 fullhouse-engine/.git.upstream-clone/
