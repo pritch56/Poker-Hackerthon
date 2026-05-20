@@ -1251,7 +1251,7 @@ def _classify_archetypes():
             profile = _opp_profile(bid)
             roll_raise, roll_fold, _, roll_n = profile
             if roll_n >= 5:
-                if roll_raise >= 0.65:
+                if roll_raise >= 0.75:  # 0.65 was catching overbet/aggressor as false maniacs
                     _archetype[bid] = "maniac"
                 elif roll_fold >= 0.65:
                     _archetype[bid] = "nit"
@@ -2669,12 +2669,6 @@ def _postflop_decision(state, n_opp, pos, is_late, is_early, is_hu,
             required = pot_odds_eff + fold_margin
             if equity < required:
                 return {"action": "fold"}
-        # Vs maniacs, TPTK alone isn't enough to call a big bet — their range
-        # is wide but we're risking a large stack fraction with ~65% equity.
-        # Require a real edge (12%) before committing chips with top pair only.
-        if any_maniac_in_hand and is_top_pair_plus and not is_strong:
-            if equity < pot_odds_eff + 0.12:
-                return {"action": "fold"}
 
     # Bluff-raise vs small bet from a foldy player (float spot).
     # Use measured fold-to-size rate for our intended raise size when we have
@@ -2824,20 +2818,20 @@ def _board_texture(board_strs):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _my_prev_street_aggression(state) -> bool:
-    """Return True if I (the seat-to-act) raised/bet on the most-recent
-    completed street.  Walks action_log, identifies streets via the same
-    state-machine as _replay_hand, and asks: was the seat-to-act among the
-    aggressors on whichever street is currently *over*?
+    """Return True if I raised/bet on the most-recent completed street.
+
+    NOTE: action_log is never reset between hands — it grows to 15k+ entries
+    over a 300-hand match.  We cap the scan at the last 120 entries which is
+    always enough to cover one full hand (max ~96 actions for 6 players × 4
+    streets × 4 actions each) without O(n) overhead.
     """
     your_seat = state["seat_to_act"]
     cur_street = state["street"]
     if cur_street == "preflop":
         return False
-    actions = state.get("action_log", [])
+    actions = state.get("action_log", [])[-120:]
     if not actions:
         return False
-    # Use replay to label each action's street, then pick previous street's
-    # aggressors.  This is cheap (~1 ms) and reuses the engine we already have.
     target_street = {"flop": "preflop", "turn": "flop", "river": "turn"}[cur_street]
     for entry, st, _pos, _pot, _tier in _replay_hand(actions):
         if st == target_street and entry.get("seat") == your_seat \
@@ -2847,9 +2841,9 @@ def _my_prev_street_aggression(state) -> bool:
 
 
 def _my_raises_this_hand(state) -> int:
-    """Total times I've raised/all-in'd in this hand so far."""
+    """Total raises/all-ins by us this hand. Capped to last 120 entries."""
     your_seat = state["seat_to_act"]
-    return sum(1 for a in state.get("action_log", [])
+    return sum(1 for a in state.get("action_log", [])[-120:]
                if a.get("seat") == your_seat
                and a.get("action") in ("raise", "all_in"))
 
