@@ -850,6 +850,20 @@ def _opp_avg_raise(bot_id):
     return s["raise_sum"] / s["raise_n"]
 
 
+def _is_true_maniac(bot_id: str) -> bool:
+    """True only when a bot shows BOTH high raise frequency AND random all-ins.
+    Overbet bots raise huge but never randomly go all-in; maniacs do both.
+    This avoids false-positives that trigger conservative logic on overbet tables.
+    Requires ≥4 non-blind actions to be reliable."""
+    s = _opp_model.get(bot_id)
+    if s is None or s["total"] < 4:
+        return False
+    non_blind = max(s["total"] - s["blinds"], 1)
+    raise_freq = s["raises"] / non_blind
+    allin_rate = s.get("all_ins", 0) / non_blind
+    return raise_freq >= 0.65 and allin_rate >= 0.04
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Deep opponent profiler — builds richer per-bot signals than the rolling
 # 200-entry _opp_model.  Maintains:
@@ -1240,8 +1254,9 @@ def _classify_archetypes():
 
         # Early maniac signal: ≥4 PF actions, ≥80% raise rate.
         # Don't wait for the full 12-action threshold — by then we've already
-        # lost chips before applying wide defense.
-        if pf_n >= 4 and pf_raise >= 0.80:
+        # lost chips before applying wide defense.  Require all-in signal to
+        # avoid misclassifying overbet bots (raise a lot, but no random jams).
+        if pf_n >= 4 and pf_raise >= 0.80 and _is_true_maniac(bid):
             _archetype[bid] = "maniac"
             continue
 
@@ -1251,7 +1266,9 @@ def _classify_archetypes():
             profile = _opp_profile(bid)
             roll_raise, roll_fold, _, roll_n = profile
             if roll_n >= 5:
-                if roll_raise >= 0.75:  # 0.65 was catching overbet/aggressor as false maniacs
+                # Require all-in signal to avoid misclassifying overbet bots (high raise
+                # rate but no random all-ins) as maniacs in early hands.
+                if roll_raise >= 0.65 and _is_true_maniac(bid):
                     _archetype[bid] = "maniac"
                 elif roll_fold >= 0.65:
                     _archetype[bid] = "nit"
@@ -1308,11 +1325,10 @@ def _archetype_counters(archetype: str) -> dict:
     * 'open_threshold_delta' — added to preflop open thresholds (medium effect)
     """
     if archetype == "maniac":
-        # Never folds → never bluff; open tighter to reduce pot exposure.
-        # Neutral deltas: their range IS wide so calling is fine, but don't
-        # loosen thresholds — we need to avoid marginal all-in commits.
-        return {"value_eq_delta": 0.0, "call_eq_delta": 0.0,
-                "bluff_freq_mult": 0.0, "open_threshold_delta": +0.05,
+        # Never folds → never bluff; open tighter to reduce pot exposure and
+        # widen 3-bet defense so we don't get blown off marginal made hands.
+        return {"value_eq_delta": -0.10, "call_eq_delta": -0.08,
+                "bluff_freq_mult": 0.0, "open_threshold_delta": +0.02,
                 "three_bet_defense_wide": True, "value_size_mult": 1.05}
     if archetype == "overbet":
         # Overbets everything — range is wide, NOT polarized.  Call wider,
@@ -1322,21 +1338,21 @@ def _archetype_counters(archetype: str) -> dict:
                 "three_bet_defense_wide": False, "value_size_mult": 1.0}
     if archetype == "nit":
         # Folds to anything → bluff more; smaller value bets to keep them in
-        return {"value_eq_delta": +0.03, "call_eq_delta": +0.025,
-                "bluff_freq_mult": 1.6, "open_threshold_delta": -0.04,
+        return {"value_eq_delta": +0.05, "call_eq_delta": +0.06,
+                "bluff_freq_mult": 1.6, "open_threshold_delta": -0.03,
                 "three_bet_defense_wide": False, "value_size_mult": 0.80}
     if archetype == "station":
         # Calls wide → bet 1.0–1.2× pot for value, never bluff
-        return {"value_eq_delta": -0.05, "call_eq_delta": 0.0,
+        return {"value_eq_delta": -0.08, "call_eq_delta": -0.05,
                 "bluff_freq_mult": 0.0, "open_threshold_delta": 0.0,
                 "three_bet_defense_wide": False, "value_size_mult": 1.20}
     if archetype == "lag":
-        return {"value_eq_delta": 0.0, "call_eq_delta": -0.01,
-                "bluff_freq_mult": 0.7, "open_threshold_delta": 0.0,
+        return {"value_eq_delta": -0.05, "call_eq_delta": -0.03,
+                "bluff_freq_mult": 0.4, "open_threshold_delta": +0.01,
                 "three_bet_defense_wide": False, "value_size_mult": 1.0}
     if archetype == "tag":
-        return {"value_eq_delta": +0.01, "call_eq_delta": +0.01,
-                "bluff_freq_mult": 0.85, "open_threshold_delta": 0.0,
+        return {"value_eq_delta": 0.0, "call_eq_delta": 0.0,
+                "bluff_freq_mult": 0.8, "open_threshold_delta": 0.0,
                 "three_bet_defense_wide": False, "value_size_mult": 1.0}
     return {"value_eq_delta": 0.0, "call_eq_delta": 0.0,
             "bluff_freq_mult": 1.0, "open_threshold_delta": 0.0,
@@ -2191,8 +2207,10 @@ def _preflop_decision(state, n_opp, pos, is_late, is_early, is_hu,
                 if aggro:
                     return _make_raise(threebet_to, state)
                 return {"action": "call"}
-            # Defend ~65-75% by HU equity.  0.42 ≈ top 70%.
-            if eq_hu >= 0.42 and owed < 0.20 * stack:
+            # Defend by HU equity.  Vs aggro (maniac) tighten to ~50% of hands
+            # to avoid calling with marginal holdings that miss flops and bleed chips.
+            defend_threshold = 0.50 if aggro else 0.42
+            if eq_hu >= defend_threshold and owed < 0.20 * stack:
                 return {"action": "call"}
             return {"action": "fold"}
 
@@ -2226,9 +2244,10 @@ def _preflop_decision(state, n_opp, pos, is_late, is_early, is_hu,
         if is_squeeze_spot and not facing_three_bet:
             squeeze_size = max(min_raise_to,
                                int(current_bet * (3.5 + 0.5 * n_callers_pre)))
-            # Squeeze only with hands that can comfortably call a 4-bet.
-            # JJ/TT/AQs create bloat-and-fold risk vs a strong 4-bet.
-            if hand in ("AA", "KK", "QQ", "AKs", "AKo"):
+            # Squeeze value hands — these have strong equity vs typical calling ranges
+            # and generate massive fold equity vs the cold-caller range (capped, no 3-bets).
+            # AQs/AJs/KQs added: ~60% equity vs typical caller + blocker effect.
+            if hand in ("AA", "KK", "QQ", "AKs", "AKo", "AQs", "AJs", "KQs"):
                 return _make_raise(squeeze_size, state)
 
         # Adjust thresholds based on opponent profile.  Aggressive openers have
@@ -2278,12 +2297,10 @@ def _preflop_decision(state, n_opp, pos, is_late, is_early, is_hu,
                 if owed < threshold * stack:
                     return {"action": "call"}
 
-            # Cold 4-bet bluff: raise + call(s) + 3-bet means caller's range
-            # is capped (they'd have 3-bet strong hands), so 3-bettor's range
-            # is actually narrower.  Mix in 4-bet bluffs with blockers.
-            cold_4bet = n_callers_pre >= 1 and not wide_defense
-            if cold_4bet and hand in ("AQs", "KQs") and owed < 0.30 * stack:
-                if random.random() < 0.30:
+            # Cold 4-bet bluff: only late position with the best blocker; rare.
+            cold_4bet = n_callers_pre >= 1 and not wide_defense and is_late
+            if cold_4bet and hand == "AQs" and owed < 0.22 * stack:
+                if random.random() < 0.15:
                     return _make_raise(threebet_to, state)
 
             return {"action": "fold"}
@@ -2408,8 +2425,10 @@ def _postflop_decision(state, n_opp, pos, is_late, is_early, is_hu,
         cards, board, n_opp, time_budget=budget, opp_ranges=opp_ranges,
     )
 
-    any_maniac_in_hand = any(_opp_archetype(bid) == "maniac"
-                             for (_, bid) in in_hand_seats)
+    # True only for bots with random all-in behaviour (real maniacs).
+    # Overbet bots have high raise rates but never random all-in — this check
+    # prevents false positives that cause under-committing vs overbet opponents.
+    any_maniac_in_hand = any(_is_true_maniac(bid) for (_, bid) in in_hand_seats)
 
     # Reward-feedback caution: tighten thresholds against opponents we're
     # losing chips to (cumulatively), loosen against ones we're winning from.
@@ -2420,16 +2439,16 @@ def _postflop_decision(state, n_opp, pos, is_late, is_early, is_hu,
 
     # Stack preservation mode: tighten all-in commit thresholds as stack
     # shrinks to avoid tournament elimination on marginal spots.
-    # Smooth ICM curve: tightening begins at 80% stack, maxes out at 40%.
+    # Smooth ICM curve: gradual tightening from 80% stack, full bonus below 60%.
     stack_ratio = stack / STARTING_STACK
     preservation_mode = stack_ratio < 0.60  # kept for spr/sizing gates below
     if stack_ratio >= 0.80:
         preserve_equity_bonus = 0.0
-    elif stack_ratio >= 0.40:
-        # Linear ramp: 0.0 at 80% → 0.10 at 40%
-        preserve_equity_bonus = 0.10 * (0.80 - stack_ratio) / 0.40
+    elif stack_ratio >= 0.60:
+        # Linear ramp: 0.0 at 80% → 0.07 at 60%
+        preserve_equity_bonus = 0.07 * (0.80 - stack_ratio) / 0.20
     else:
-        preserve_equity_bonus = 0.10
+        preserve_equity_bonus = 0.07  # full bonus below 60% (matches original)
 
     # Hand classification — categorical strength + draw type.
     hc = _classify_postflop(cards, board)
@@ -2507,11 +2526,20 @@ def _postflop_decision(state, n_opp, pos, is_late, is_early, is_hu,
             return _make_raise(int(state["current_bet"] + pot * probe_mult), state)
 
         # Thin value bet when MC says we're clearly ahead but hand has no tier match.
-        # Size proportional to edge — small with marginal, up to 60% pot with solid lead.
-        # Skip river (bet on river only when classified strong); skip multi-way (variance).
-        if equity >= 0.60 and street != "river" and n_opp == 1:
+        # In position: lower threshold (0.57) since we can fold to check-raises cheaply.
+        # OOP: keep 0.60 to avoid value-betting into better ranges.
+        # Skip river here — handled separately below.
+        thin_thresh = 0.57 if is_late else 0.60
+        if equity >= thin_thresh and street != "river" and n_opp == 1:
             edge = equity - 0.50
             size_mult = min(0.60, 0.38 + edge * 1.1)
+            return _make_raise(int(state["current_bet"] + pot * size_mult), state)
+
+        # River thin value — there's no later street to extract from; bet small now.
+        # Only in position, HU, not vs aggro (risk of check-raise bluff), clear edge.
+        if (street == "river" and equity >= 0.63 and n_opp == 1
+                and is_late and not aggro and not btex["paired"]):
+            size_mult = min(0.52, 0.35 + (equity - 0.50) * 0.8)
             return _make_raise(int(state["current_bet"] + pot * size_mult), state)
 
         # High-equity (per MC) but uncategorised — check to extract on later streets.
@@ -2585,12 +2613,12 @@ def _postflop_decision(state, n_opp, pos, is_late, is_early, is_hu,
 
     # Commit thresholds — strong hands jam, weak ones never.
     # In preservation mode, require higher equity to avoid busting on marginal spots.
-    # Vs maniacs: tighten SPR gate (1.5 not 3.0) and equity jam gate (0.80 not 0.72)
-    # to avoid busting on marginal ~60% equity all-ins against volatile wide ranges.
+    # Vs maniacs: tighten SPR gate (1.5 not 3.0) to avoid busting on marginal
+    # ~60% equity all-ins against volatile wide ranges.
     commit_strong_spr = (1.5 if any_maniac_in_hand
                          else (3.0 if not preservation_mode else 1.5))
-    commit_eq_hi     = 0.80 + preserve_equity_bonus
-    commit_eq_lo     = 0.72 + preserve_equity_bonus
+    commit_eq_hi = 0.80 + preserve_equity_bonus
+    commit_eq_lo = 0.72 + preserve_equity_bonus
 
     if is_strong and spr <= commit_strong_spr:
         return {"action": "all_in"}
@@ -2600,8 +2628,11 @@ def _postflop_decision(state, n_opp, pos, is_late, is_early, is_hu,
         return _make_raise(target, state)
     if equity >= commit_eq_hi and spr <= 2.5:
         return {"action": "all_in"}
-    equity_jam_lo = commit_eq_hi if any_maniac_in_hand else commit_eq_lo
-    if equity >= equity_jam_lo and spr <= 1.5 and n_opp <= 2 and not facing_reraise:
+    # Vs maniacs: also commit with high-equity hands (overpairs, TPTK) sooner —
+    # their wide range means 65%+ equity is a large edge worth jamming.
+    if any_maniac_in_hand and equity >= 0.65 and spr <= 3.0 and n_opp <= 2:
+        return {"action": "all_in"}
+    if equity >= commit_eq_lo and spr <= 1.5 and n_opp <= 2 and not facing_reraise:
         return {"action": "all_in"}
 
     # Facing a re-raise on the same street — opponent's range narrows hard.
@@ -2638,7 +2669,9 @@ def _postflop_decision(state, n_opp, pos, is_late, is_early, is_hu,
     # Otherwise treat as polarized and require stronger hands.
     if huge_bet:
         last_raiser_bid_arch = _opp_archetype(last_raiser_bid) if last_raiser_bid else "unknown"
-        opp_is_overbet_type = (last_raiser_bid_arch == "overbet")
+        # Maniacs and overbet bots both have wide ranges — treat huge bets the same way:
+        # call with any positive equity edge, not just with polarized-range hands.
+        opp_is_overbet_type = (last_raiser_bid_arch in ("overbet", "maniac"))
         if opp_is_overbet_type:
             # Range is wide, not polarized — call with any positive equity edge
             # over pot odds (same as standard call zone but applied here early).
@@ -2714,10 +2747,13 @@ def _postflop_decision(state, n_opp, pos, is_late, is_early, is_hu,
             cbets_cr = [c for c in cbets_cr if c is not None]
             if cbets_cr:
                 avg_cbet_cr = sum(cbets_cr) / len(cbets_cr)
-        if avg_cbet_cr is not None and avg_cbet_cr >= 0.65:
-            cr_size = max(min_raise_to, int((pot + owed) * 2.2))
-            if cr_size <= stack:
-                return _make_raise(cr_size, state)
+        # Require high cbet rate AND opponent folds to big bets (not a calling station)
+        if avg_cbet_cr is not None and avg_cbet_cr >= 0.78:
+            fold_rate_cr = _avg_opp_fold_to_size(in_hand_ids_cr, "big")
+            if fold_rate_cr is None or fold_rate_cr >= 0.40:
+                cr_size = max(min_raise_to, int((pot + owed) * 2.2))
+                if cr_size <= stack:
+                    return _make_raise(cr_size, state)
 
     # Apply archetype counters to call/raise thresholds (#6).
     # caution > 1 → losing to these opps → tighten (subtract less / add more)
